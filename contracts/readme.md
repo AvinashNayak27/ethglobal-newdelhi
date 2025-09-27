@@ -21,7 +21,7 @@ A decentralized escrow system that facilitates secure exchanges between UPI paym
 - `claimFunds()` - Buyers claim tokens after successful UPI payment
 - `withdrawRemainingFunds()` - Sellers withdraw unclaimed funds
 
-**Deployed Address:** [0x231ad09598658e964f4d3784f921040c53b08557](https://worldscan.org/address/0x231ad09598658e964f4d3784f921040c53b08557)
+**Deployed Address:** [0x0d10a74eec2456e8404752b5d8d4cfc393f09e7d](https://worldscan.org/address/0x0d10a74eec2456e8404752b5d8d4cfc393f09e7d)
 
 ### 2. Pluto Attestation Verifier (`plutoVerifier.sol`)
 
@@ -40,7 +40,7 @@ A comprehensive attestation verification system that validates payment proofs us
 - `calculateScriptHash()` - Computes script hash
 - `calculateSessionHash()` - Computes session hash
 
-**Deployed Address:** [0x5224BbbC92D86019550e34890796Feb8ea09Ed38](https://worldscan.org/address/0x5224BbbC92D86019550e34890796Feb8ea09Ed38)
+**Deployed Address:** [0xcfd5a1d5aec34d9d147b812eec84b3d660f17aef](https://worldscan.org/address/0xcfd5a1d5aec34d9d147b812eec84b3d660f17aef)
 
 ## Configuration
 
