@@ -1,8 +1,14 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #F5EEE6; /* light beige */
+  --foreground: #382f2a; /* deep coffee */
+  --surface: #FFF9F0; /* card surface */
+  --border: #E6DCCF; /* soft border */
+  --primary: #8B5E34; /* warm brown */
+  --primary-hover: #7A512B; /* deeper brown */
+  --muted: #CBB8A5; /* muted beige */
+  --muted-ink: #6B5C50; /* subdued text */
 }
 
 @theme inline {
@@ -14,8 +20,14 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: #1f1a16; /* deep brown */
+    --foreground: #EDE3D7; /* warm ivory */
+    --surface: #2A241E;
+    --border: #3A3027;
+    --primary: #D6A269; /* lighter brown accent */
+    --primary-hover: #C48E52;
+    --muted: #4B4037;
+    --muted-ink: #D8C9BA;
   }
 }
 
@@ -23,4 +35,34 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Subtle motion utilities */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 400ms ease-out both;
+}
+
+.hover-lift {
+  transition: transform 200ms ease, box-shadow 200ms ease;
+}
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.06);
+}
+
+/* Surfaces mapped to the beige palette */
+.card-surface {
+  background: var(--surface);
+  border: 1px solid var(--border);
 }

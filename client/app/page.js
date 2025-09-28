@@ -10,7 +10,7 @@ import {
   ISuccessResult,
 } from "@worldcoin/minikit-js";
 import { useWaitForTransactionReceipt } from "@worldcoin/minikit-react";
-import { createPublicClient, http, createWalletClient } from "viem";
+import { createPublicClient, http, createWalletClient, parseAbiItem } from "viem";
 import { worldchain } from "viem/chains";
 import { escrowABI, escrowV1Address } from "../utils/constants.js";
 import Pluto from "@plutoxyz/frame-js";
@@ -79,7 +79,7 @@ export default function Home() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [sessionRestored, setSessionRestored] = useState(false);
-  const [activeTab, setActiveTab] = useState("onramp");
+  const [activeTab, setActiveTab] = useState("buy");
   const [isLoading, setIsLoading] = useState(false);
   const [transactionId, setTransactionId] = useState("");
   const [transactionStatus, setTransactionStatus] = useState("");
@@ -105,6 +105,12 @@ export default function Home() {
 
   // New: Track if contract data is being refreshed
   const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Stepper & History states
+  const [selectedDepositId, setSelectedDepositId] = useState(null);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [historyEvents, setHistoryEvents] = useState([]);
+  const [historyMineOnly, setHistoryMineOnly] = useState(false);
 
   const hooks = {
     onScriptLog: (log) => console.log("Log:", log),
@@ -569,6 +575,167 @@ main().catch(() => process.exit(1));
     setIsRefreshing(false);
   };
 
+  // Load history from logs
+  const loadHistory = async () => {
+    try {
+      setIsLoadingHistory(true);
+      const toBlock = await client.getBlockNumber();
+      const fromBlock = toBlock > 150000n ? toBlock - 150000n : 0n;
+
+      const evFundsDeposited = parseAbiItem(
+        "event FundsDeposited(uint256 depositId, address seller, string upiId, uint256 remainingFunds, uint256 minimumAmount)"
+      );
+      const evBuyerIntent = parseAbiItem(
+        "event BuyerIntent(uint256 depositId, address buyer, uint256 amount)"
+      );
+      const evIntentCancelled = parseAbiItem(
+        "event IntentCancelled(address buyer, uint256 depositId)"
+      );
+      const evPaymentClaimed = parseAbiItem(
+        "event PaymentClaimed(address buyer, uint256 wldAmount, string upiTransactionId)"
+      );
+      const evFundsWithdrawn = parseAbiItem(
+        "event FundsWithdrawn(address seller, uint256 depositId, uint256 amount)"
+      );
+
+      const [logsDeposited, logsIntent, logsCancelled, logsClaimed, logsWithdrawn] = await Promise.all([
+        client.getLogs({ address: escrowV1Address, event: evFundsDeposited, fromBlock, toBlock }),
+        client.getLogs({ address: escrowV1Address, event: evBuyerIntent, fromBlock, toBlock }),
+        client.getLogs({ address: escrowV1Address, event: evIntentCancelled, fromBlock, toBlock }),
+        client.getLogs({ address: escrowV1Address, event: evPaymentClaimed, fromBlock, toBlock }),
+        client.getLogs({ address: escrowV1Address, event: evFundsWithdrawn, fromBlock, toBlock }),
+      ]);
+
+      const normalize = [];
+      for (const l of logsDeposited) {
+        normalize.push({
+          type: "FundsDeposited",
+          blockNumber: l.blockNumber,
+          txHash: l.transactionHash,
+          data: {
+            depositId: l.args.depositId,
+            seller: l.args.seller,
+            upiId: l.args.upiId,
+            remainingFunds: l.args.remainingFunds,
+            minimumAmount: l.args.minimumAmount,
+          },
+        });
+      }
+      for (const l of logsIntent) {
+        normalize.push({
+          type: "BuyerIntent",
+          blockNumber: l.blockNumber,
+          txHash: l.transactionHash,
+          data: {
+            depositId: l.args.depositId,
+            buyer: l.args.buyer,
+            amount: l.args.amount,
+          },
+        });
+      }
+      for (const l of logsCancelled) {
+        normalize.push({
+          type: "IntentCancelled",
+          blockNumber: l.blockNumber,
+          txHash: l.transactionHash,
+          data: {
+            buyer: l.args.buyer,
+            depositId: l.args.depositId,
+          },
+        });
+      }
+      for (const l of logsClaimed) {
+        normalize.push({
+          type: "PaymentClaimed",
+          blockNumber: l.blockNumber,
+          txHash: l.transactionHash,
+          data: {
+            buyer: l.args.buyer,
+            wldAmount: l.args.wldAmount,
+            upiTransactionId: l.args.upiTransactionId,
+          },
+        });
+      }
+      for (const l of logsWithdrawn) {
+        normalize.push({
+          type: "FundsWithdrawn",
+          blockNumber: l.blockNumber,
+          txHash: l.transactionHash,
+          data: {
+            seller: l.args.seller,
+            depositId: l.args.depositId,
+            amount: l.args.amount,
+          },
+        });
+      }
+
+      normalize.sort((a, b) => Number(b.blockNumber - a.blockNumber));
+      setHistoryEvents(normalize);
+    } catch (e) {
+      console.error("Error loading history logs:", e);
+      setHistoryEvents([]);
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  };
+
+  // Auto-refresh: on new blocks (polling), on focus/visibility, periodic backup, and after confirmations
+  useEffect(() => {
+    if (!isWorldAppReady) return;
+    let lastCallTs = 0;
+    const unwatch = client.watchBlockNumber({
+      pollingInterval: 6000,
+      onBlockNumber: () => {
+        const now = Date.now();
+        if (isRefreshing) return;
+        if (now - lastCallTs < 4000) return;
+        lastCallTs = now;
+        loadContractData();
+        loadHistory();
+      },
+      onError: (e) => console.error("watchBlockNumber error", e),
+    });
+    return () => {
+      if (unwatch) unwatch();
+    };
+  }, [isWorldAppReady, isRefreshing, userInfo?.address]);
+
+  useEffect(() => {
+    if (!isWorldAppReady) return;
+    const onFocus = () => {
+      if (!isRefreshing) loadContractData();
+    };
+    const onVisibility = () => {
+      if (!document.hidden && !isRefreshing) loadContractData();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [isWorldAppReady, isRefreshing]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const id = setInterval(() => {
+      if (!isRefreshing) loadContractData();
+    }, 20000);
+    return () => clearInterval(id);
+  }, [isAuthenticated, isRefreshing, userInfo?.address]);
+
+  useEffect(() => {
+    if (isWorldAppReady) {
+      loadHistory();
+    }
+  }, [isWorldAppReady, isAuthenticated, userInfo?.address]);
+
+  useEffect(() => {
+    if (isConfirmed) {
+      loadContractData();
+    }
+  }, [isConfirmed]);
+
   // Helper functions to format proof data for contract calls
   const formatProofData = (data) => {
     return Object.entries(data).map(([key, value]) => ({
@@ -946,8 +1113,11 @@ main().catch(() => process.exit(1));
   //   - There is an intent, but it is claimed (i.e. buyerIntent.claimed === true)
   const canSignalIntent = !buyerIntent || (buyerIntent && buyerIntent.claimed);
 
+  const formatWLD = (v) => (Number(v) / 10 ** 18).toFixed(6);
+  const currentBuyStep = buyerIntent && !buyerIntent.claimed ? 3 : selectedDepositId ? 2 : 1;
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800">
+    <div className="min-h-screen bg-gradient-to-br from-[var(--background)] to-[var(--surface)]">
       <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700 px-6 py-4">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
@@ -982,7 +1152,7 @@ main().catch(() => process.exit(1));
                 <button
                   onClick={signInWithWallet}
                   disabled={isAuthenticating}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200"
+                  className="px-4 py-2 bg-[var(--primary)] hover:bg-[var(--primary-hover)] disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200 hover-lift"
                 >
                   {isAuthenticating ? "Signing in..." : "Sign in with Wallet"}
                 </button>
@@ -1046,34 +1216,44 @@ main().catch(() => process.exit(1));
         ) : (
           <>
             {/* Tab Navigation */}
-            <div className="mb-8 flex items-center justify-between">
-              <div className="flex space-x-1 bg-white dark:bg-gray-800 rounded-lg p-1 shadow-sm">
+            <div className="mb-8 flex items-center justify-between w-full">
+              <div className="flex space-x-1 card-surface rounded-lg p-1 shadow-sm hover-lift animate-fade-in-up w-full">
                 <button
-                  onClick={() => setActiveTab("onramp")}
+                  onClick={() => setActiveTab("buy")}
                   className={`flex-1 px-6 py-3 text-sm font-medium rounded-md transition-all duration-200 ${
-                    activeTab === "onramp"
-                      ? "bg-blue-600 text-white shadow-sm"
+                    activeTab === "buy"
+                      ? "bg-[var(--primary)] text-white shadow-sm"
                       : "text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-gray-700"
                   }`}
                 >
-                  💰 Onramp (Buy WLD)
+                  💰 Buy
                 </button>
                 <button
                   onClick={() => setActiveTab("sell")}
                   className={`flex-1 px-6 py-3 text-sm font-medium rounded-md transition-all duration-200 ${
                     activeTab === "sell"
-                      ? "bg-green-600 text-white shadow-sm"
+                      ? "bg-[var(--primary)] text-white shadow-sm"
                       : "text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-gray-700"
                   }`}
                 >
-                  🏪 Sell (Deposit WLD)
+                  🏪 Sell
+                </button>
+                <button
+                  onClick={() => setActiveTab("history")}
+                  className={`flex-1 px-6 py-3 text-sm font-medium rounded-md transition-all duration-200 ${
+                    activeTab === "history"
+                      ? "bg-[var(--primary)] text-white shadow-sm"
+                      : "text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-gray-700"
+                  }`}
+                >
+                  📜 History
                 </button>
               </div>
               {/* Refresh Button */}
               <button
                 onClick={handleRefresh}
                 disabled={isRefreshing}
-                className={`ml-4 flex items-center px-3 py-2 rounded-md text-sm font-medium transition-colors duration-200 ${
+                className={`hidden ml-4 flex items-center px-3 py-2 rounded-md text-sm font-medium transition-colors duration-200 ${
                   isRefreshing
                     ? "bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed"
                     : "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
@@ -1100,28 +1280,11 @@ main().catch(() => process.exit(1));
             </div>
 
             {/* Tab Content */}
-            {activeTab === "onramp" ? (
+            {activeTab === "buy" ? (
               <div className="space-y-6">
-                {/* Welcome Message */}
-                <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center space-x-3">
-                      <div className="w-3 h-3 bg-green-500 rounded-full"></div>
-                      <span className="text-sm text-gray-600 dark:text-gray-300">
-                        Welcome back, {userInfo.name}! You're ready to trade.
-                      </span>
-                    </div>
-                    {sessionRestored && (
-                      <span className="text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 px-2 py-1 rounded">
-                        Session restored
-                      </span>
-                    )}
-                  </div>
-                </div>
-
                 {/* Current Intent Status */}
-                {buyerIntent && (
-                  <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                {buyerIntent && !buyerIntent.claimed && (
+                  <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
                       🎯 Active Intent
                     </h3>
@@ -1184,7 +1347,7 @@ main().catch(() => process.exit(1));
                           <button
                             onClick={() => setShowClaimForm(!showClaimForm)}
                             disabled={isLoading}
-                            className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200"
+                            className="px-4 py-2 bg-[var(--primary)] hover:bg-[var(--primary-hover)] disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200 hover-lift"
                           >
                             {showClaimForm ? "Hide Claim Form" : "Claim Funds"}
                           </button>
@@ -1199,7 +1362,7 @@ main().catch(() => process.exit(1));
                             <button
                               onClick={claimFunds}
                               disabled={isLoading}
-                              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200"
+                              className="px-4 py-2 bg-[var(--primary)] hover:bg-[var(--primary-hover)] disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200 hover-lift"
                             >
                               {isLoading
                                 ? "Claiming..."
@@ -1215,7 +1378,7 @@ main().catch(() => process.exit(1));
                 )}
 
                 {/* Available Deposits */}
-                <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
                       🏪 Available Deposits
@@ -1223,7 +1386,7 @@ main().catch(() => process.exit(1));
                     <button
                       onClick={handleRefresh}
                       disabled={isRefreshing}
-                      className={`flex items-center px-2 py-1 rounded text-xs font-medium transition-colors duration-200 ${
+                      className={`hidden flex items-center px-2 py-1 rounded text-xs font-medium transition-colors duration-200 ${
                         isRefreshing
                           ? "bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed"
                           : "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
@@ -1249,44 +1412,44 @@ main().catch(() => process.exit(1));
                     </button>
                   </div>
                   <div className="space-y-4 max-h-64 overflow-y-auto">
-                    {deposits.length > 0 ? (
-                      deposits.map((deposit) => (
-                        <div
-                          key={deposit.id}
-                          className="border border-gray-200 dark:border-gray-600 rounded-lg p-4"
-                        >
-                          <div className="grid grid-cols-2 gap-4 text-sm">
-                            <div>
-                              <p className="text-gray-600 dark:text-gray-300">
-                                <span className="font-medium">ID:</span>{" "}
-                                {deposit.id}
-                              </p>
-                              <p className="text-gray-600 dark:text-gray-300">
-                                <span className="font-medium">UPI ID:</span>{" "}
-                                {deposit.upiId}
-                              </p>
+                    {deposits.filter(d => Number(d.remainingFunds) > 0).length > 0 ? (
+                      deposits
+                        .filter(deposit => Number(deposit.remainingFunds) > 0)
+                        .map((deposit) => (
+                          <div
+                            key={deposit.id}
+                            className="border border-gray-200 dark:border-gray-600 rounded-lg p-4"
+                          >
+                            <div className="grid grid-cols-2 gap-4 text-sm">
+                              <div>
+                                <p className="text-gray-600 dark:text-gray-300">
+                                  <span className="font-medium">ID:</span>{" "}
+                                  {deposit.id}
+                                </p>
+                                <p className="text-gray-600 dark:text-gray-300">
+                                  <span className="font-medium">UPI ID:</span>{" "}
+                                  {deposit.upiId}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-gray-600 dark:text-gray-300">
+                                  <span className="font-medium">Available:</span>{" "}
+                                  {formatWLD(deposit.remainingFunds)}{" "}
+                                  WLD
+                                </p>
+                                <p className="text-gray-600 dark:text-gray-300">
+                                  <span className="font-medium">Min Amount:</span>{" "}
+                                  {formatWLD(deposit.minimumAmount)}{" "}
+                                  WLD
+                                </p>
+                              </div>
                             </div>
-                            <div>
-                              <p className="text-gray-600 dark:text-gray-300">
-                                <span className="font-medium">Available:</span>{" "}
-                                {(
-                                  Number(deposit.remainingFunds) /
-                                  10 ** 18
-                                ).toFixed(6)}{" "}
-                                WLD
-                              </p>
-                              <p className="text-gray-600 dark:text-gray-300">
-                                <span className="font-medium">Min Amount:</span>{" "}
-                                {(
-                                  Number(deposit.minimumAmount) /
-                                  10 ** 18
-                                ).toFixed(6)}{" "}
-                                WLD
-                              </p>
+                            <div className="pt-3 flex items-center gap-2">
+                              <button onClick={() => setSelectedDepositId(deposit.id)} className="px-3 py-2 text-xs bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-white rounded">Select</button>
+                              <CopyButton value={deposit.upiId.toLowerCase()} label="UPI ID" />
                             </div>
                           </div>
-                        </div>
-                      ))
+                        ))
                     ) : (
                       <p className="text-gray-500 dark:text-gray-400 text-center py-4">
                         No deposits available
@@ -1297,7 +1460,7 @@ main().catch(() => process.exit(1));
 
                 {/* Signal Intent Form */}
                 {canSignalIntent && (
-                  <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                  <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
                       📝 Signal Intent to Buy
                     </h3>
@@ -1308,7 +1471,7 @@ main().catch(() => process.exit(1));
                         </label>
                         <input
                           type="number"
-                          value={depositId}
+                          value={depositId || selectedDepositId || ""}
                           onChange={(e) => setDepositId(e.target.value)}
                           placeholder="Enter deposit ID"
                           className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
@@ -1332,11 +1495,11 @@ main().catch(() => process.exit(1));
                         onClick={signalIntent}
                         disabled={
                           !isAuthenticated ||
-                          !depositId ||
+                          !(depositId || selectedDepositId) ||
                           !buyAmount ||
                           isLoading
                         }
-                        className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors duration-200"
+                        className="w-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors duration-200 hover-lift"
                       >
                         {isLoading ? "Signaling Intent..." : "Signal Intent"}
                       </button>
@@ -1350,10 +1513,10 @@ main().catch(() => process.exit(1));
                   </div>
                 )}
               </div>
-            ) : (
+            ) : activeTab === "sell" ? (
               <div className="space-y-6">
                 {/* Welcome Message */}
-                <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center space-x-3">
                       <div className="w-3 h-3 bg-green-500 rounded-full"></div>
@@ -1370,7 +1533,7 @@ main().catch(() => process.exit(1));
                 </div>
 
                 {/* Deposit Funds Form */}
-                <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
                   <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
                     💳 Deposit WLD for Sale
                   </h3>
@@ -1424,7 +1587,7 @@ main().catch(() => process.exit(1));
                         !minimumAmount ||
                         isLoading
                       }
-                      className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors duration-200"
+                      className="w-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors duration-200 hover-lift"
                     >
                       {isLoading ? "Depositing..." : "Deposit Funds"}
                     </button>
@@ -1432,7 +1595,7 @@ main().catch(() => process.exit(1));
                 </div>
 
                 {/* Your Deposits */}
-                <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
                       📊 Your Deposits
@@ -1440,7 +1603,7 @@ main().catch(() => process.exit(1));
                     <button
                       onClick={handleRefresh}
                       disabled={isRefreshing}
-                      className={`flex items-center px-2 py-1 rounded text-xs font-medium transition-colors duration-200 ${
+                      className={`hidden flex items-center px-2 py-1 rounded text-xs font-medium transition-colors duration-200 ${
                         isRefreshing
                           ? "bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed"
                           : "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
@@ -1519,6 +1682,64 @@ main().catch(() => process.exit(1));
                   </div>
                 </div>
               </div>
+            ) : (
+              <div className="space-y-6">
+                <div className="card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-semibold text-gray-900 dark:text-white">📜 History</h3>
+                    <div className="flex items-center gap-2 text-xs">
+                      <label className="flex items-center gap-1">
+                        <input type="checkbox" checked={historyMineOnly} onChange={(e) => setHistoryMineOnly(e.target.checked)} />
+                        <span>My activity</span>
+                      </label>
+                    </div>
+                  </div>
+                  <div className="space-y-2 max-h-96 overflow-y-auto text-sm">
+                    {isLoadingHistory ? (
+                      <p className="text-gray-500">Loading history…</p>
+                    ) : historyEvents.length === 0 ? (
+                      <p className="text-gray-500">No recent activity</p>
+                    ) : (
+                      historyEvents
+                        .filter((e) => {
+                          if (!historyMineOnly || !userInfo?.address) return true;
+                          const addr = userInfo.address.toLowerCase();
+                          const d = e.data || {};
+                          return (
+                            d.buyer?.toLowerCase?.() === addr ||
+                            d.seller?.toLowerCase?.() === addr
+                          );
+                        })
+                        .slice(0, 100)
+                        .map((e, idx) => (
+                          <div key={`${e.txHash}-${idx}`} className="border border-[var(--border)] rounded p-3">
+                            <div className="flex items-center justify-between">
+                              <span className="font-medium">{e.type}</span>
+                              <span className="text-xs text-gray-500">Block {String(e.blockNumber)}</span>
+                            </div>
+                            <div className="mt-1 text-xs text-gray-700 dark:text-gray-300">
+                              {e.type === "FundsDeposited" && (
+                                <span>Seller {e.data.seller?.slice(0, 6)}…{e.data.seller?.slice(-4)} • ID {String(e.data.depositId)} • {formatWLD(e.data.remainingFunds)} WLD</span>
+                              )}
+                              {e.type === "BuyerIntent" && (
+                                <span>Buyer {e.data.buyer?.slice(0, 6)}…{e.data.buyer?.slice(-4)} • Deposit {String(e.data.depositId)} • {formatWLD(e.data.amount)} WLD</span>
+                              )}
+                              {e.type === "IntentCancelled" && (
+                                <span>Buyer {e.data.buyer?.slice(0, 6)}…{e.data.buyer?.slice(-4)} cancelled • Deposit {String(e.data.depositId)}</span>
+                              )}
+                              {e.type === "PaymentClaimed" && (
+                                <span>Buyer {e.data.buyer?.slice(0, 6)}…{e.data.buyer?.slice(-4)} claimed {formatWLD(e.data.wldAmount)} WLD</span>
+                              )}
+                              {e.type === "FundsWithdrawn" && (
+                                <span>Seller {e.data.seller?.slice(0, 6)}…{e.data.seller?.slice(-4)} withdrew {formatWLD(e.data.amount)} WLD • ID {String(e.data.depositId)}</span>
+                              )}
+                            </div>
+                          </div>
+                        ))
+                    )}
+                  </div>
+                </div>
+              </div>
             )}
 
             {/* Transaction Status */}
@@ -1546,7 +1767,7 @@ main().catch(() => process.exit(1));
             )}
 
             {/* Instructions */}
-            <div className="mt-8 bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+            <div className="mt-8 card-surface rounded-xl p-6 hover-lift animate-fade-in-up">
               <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
                 📋 How it Works
               </h3>
