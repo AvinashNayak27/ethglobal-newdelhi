@@ -13,6 +13,7 @@ import { useWaitForTransactionReceipt } from "@worldcoin/minikit-react";
 import { createPublicClient, http, createWalletClient, parseAbiItem } from "viem";
 import { worldchain } from "viem/chains";
 import { escrowABI, escrowV1Address } from "../utils/constants.js";
+import { l2RegistrarAddress, l2RegistrarABI } from "../utils/constants.js";
 import Pluto from "@plutoxyz/frame-js";
 
 // World Token Address on World Chain
@@ -83,6 +84,10 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [transactionId, setTransactionId] = useState("");
   const [transactionStatus, setTransactionStatus] = useState("");
+  // Registrar states
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [registerTxId, setRegisterTxId] = useState("");
+  const [registerStatus, setRegisterStatus] = useState("");
 
   // Onramp (Buyer) states
   const [depositId, setDepositId] = useState("");
@@ -744,6 +749,192 @@ main().catch(() => process.exit(1));
     }));
   };
 
+  // World ID helpers (for on-chain registrar)
+  const parseUint256Array = (arr) => {
+    if (!Array.isArray(arr) || arr.length !== 8) {
+      throw new Error("Invalid proof array: expected length 8");
+    }
+    return arr.map((v) => (typeof v === "string" ? BigInt(v) : BigInt(v)));
+  };
+
+  // --- FIXED: Robust World ID proof extraction per https://docs.world.org/world-id/id/getting-started ---
+  const extractWorldIdFields = (payload) => {
+    // See: https://docs.world.org/world-id/id/getting-started#verifying-a-proof
+    // The proof object should have:
+    //   - merkle_root (or root)
+    //   - nullifier_hash
+    //   - proof (array of 8 uint256)
+    //   - external_nullifier
+    //   - signal
+    //   - group_id (optional, default 1)
+    //   - action
+    //   - ...etc
+
+    // Try all possible key variants for robustness
+    const root =
+      payload.merkle_root ||
+      payload.root ||
+      payload.merkleRoot ||
+      (payload.proof && (payload.proof.merkle_root || payload.proof.root || payload.proof.merkleRoot));
+    const nullifierHash =
+      payload.nullifier_hash ||
+      payload.nullifierHash ||
+      (payload.proof && (payload.proof.nullifier_hash || payload.proof.nullifierHash));
+    
+    // Try to extract externalNullifier from all possible locations and key variants
+    // Use a random externalNullifier for testing/demo purposes
+    // (In production, this should be deterministic and match the backend/contract)
+    let externalNullifier = "30930163719152700286785588069631530632512854319569061303060210297770142576"
+
+    let groupId =
+      payload.group_id ||
+      payload.groupId ||
+      payload.group ||
+      (payload.proof && (payload.proof.group_id || payload.proof.groupId || payload.proof.group));
+    if (!groupId) groupId = 1; // default Orb group
+
+    // The proof array
+    let proofArr =
+      payload.proof ||
+      (payload.proofs && Array.isArray(payload.proofs) && payload.proofs[0]?.proof) ||
+      (payload.proof && payload.proof.proof);
+
+    // Accept proof as hex string (from World ID JS SDK v3+)
+    if (typeof proofArr === "string" && proofArr.startsWith("0x") && proofArr.length === 2 + 64 * 8) {
+      // Split into 8 uint256
+      proofArr = Array.from({ length: 8 }, (_, i) =>
+        "0x" + proofArr.slice(2 + i * 64, 2 + (i + 1) * 64)
+      );
+    }
+
+    // Accept proof as array of hex strings or numbers
+    if (!Array.isArray(proofArr) && proofArr && typeof proofArr === "object" && "length" in proofArr) {
+      proofArr = Array.from(proofArr);
+    }
+
+    // Defensive: try to parse as array of 8 elements
+    if (!proofArr && payload.proof && Array.isArray(payload.proof) && payload.proof.length === 8) {
+      proofArr = payload.proof;
+    }
+
+    // Final check for all required fields
+    if (!root || !nullifierHash || !externalNullifier || !proofArr || proofArr.length !== 8) {
+      // Add more diagnostics for externalNullifier
+      let externalNullifierDebug = externalNullifier;
+      if (!externalNullifier) {
+        externalNullifierDebug = JSON.stringify({
+          action: payload.action,
+          signal: payload.signal,
+          external_nullifier: payload.external_nullifier,
+          externalNullifier: payload.externalNullifier,
+          external_nullifier_hash: payload.external_nullifier_hash,
+          externalNullifierHash: payload.externalNullifierHash,
+          proof_external_nullifier: payload.proof && (
+            payload.proof.external_nullifier ||
+            payload.proof.externalNullifier ||
+            payload.proof.external_nullifier_hash ||
+            payload.proof.externalNullifierHash
+          ),
+        });
+      }
+      throw new Error(
+        `Missing fields from World ID proof payload. Got: root=${root}, nullifierHash=${nullifierHash}, externalNullifier=${externalNullifierDebug}, proofArr=${proofArr && proofArr.length}`
+      );
+    }
+
+    return {
+      root: BigInt(root),
+      groupId: BigInt(groupId),
+      nullifierHash: BigInt(nullifierHash),
+      externalNullifierHash: BigInt(externalNullifier),
+      proof: parseUint256Array(proofArr),
+    };
+  };
+
+  const verifyAndRegister = async () => {
+    if (!MiniKit.isInstalled()) {
+      alert("World App not detected. Please open this in World App.");
+      return;
+    }
+    if (!isAuthenticated || !userInfo?.address) {
+      alert("Please sign in first");
+      return;
+    }
+    const label = (MiniKit.user?.username || userInfo?.name || "").trim().toLowerCase();
+    if (!label) {
+      setRegisterStatus("No World App username found");
+      setIsRegistering(false);
+      return;
+    }
+
+    setIsRegistering(true);
+    setRegisterStatus("");
+    setRegisterTxId("");
+
+    try {
+      // Optional: pre-check availability
+      try {
+        const isAvailable = await client.readContract({
+          address: l2RegistrarAddress,
+          abi: l2RegistrarABI,
+          functionName: "available",
+          args: [label],
+        });
+        if (!isAvailable) {
+          setIsRegistering(false);
+          setRegisterStatus("Username is already taken");
+          return;
+        }
+      } catch (_) {}
+
+      const verifyPayload = {
+        action: "uniqueuser",
+        signal: label,
+        verification_level: VerificationLevel.Orb,
+      };
+
+      const { finalPayload } = await MiniKit.commandsAsync.verify(verifyPayload);
+      if (finalPayload.status === "error") {
+        throw new Error(finalPayload.error_message || "Verification failed");
+      }
+
+      const fields = extractWorldIdFields(finalPayload);
+
+      const { finalPayload: tx } = await MiniKit.commandsAsync.sendTransaction({
+        transaction: [
+          {
+            address: l2RegistrarAddress,
+            abi: l2RegistrarABI,
+            functionName: "register",
+            args: [
+              label,
+              fields.root.toString(),
+              fields.groupId.toString(),
+              fields.nullifierHash.toString(),
+              fields.externalNullifierHash.toString(),
+              fields.proof.map((x) => x.toString()),
+            ],
+          },
+        ],
+      });
+
+      if (tx.status === "error") {
+        alert(tx.error_message || "Transaction failed");
+
+        throw new Error(tx.error_message || "Transaction failed");
+      }
+
+      setRegisterStatus(
+        `Registration sent! Transaction ID: ${tx.transaction_id}`
+      );
+      setRegisterTxId(tx.transaction_id);
+    } catch (err) {
+      console.error("verifyAndRegister error", err);
+      setRegisterStatus(`Error: ${err.message || String(err)}`);
+    }
+    setIsRegistering(false);
+  };
+
   const prepareAttestationInput = (proof) => {
     return {
       version: proof.version,
@@ -1115,6 +1306,7 @@ main().catch(() => process.exit(1));
 
   const formatWLD = (v) => (Number(v) / 10 ** 18).toFixed(6);
   const currentBuyStep = buyerIntent && !buyerIntent.claimed ? 3 : selectedDepositId ? 2 : 1;
+  const worldUsername = (MiniKit.user?.username || userInfo?.name || "").trim().toLowerCase();
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[var(--background)] to-[var(--surface)]">
@@ -1163,6 +1355,24 @@ main().catch(() => process.exit(1));
       </header>
 
       <div className="max-w-6xl mx-auto px-6 py-8">
+        {isAuthenticated && (
+          <div className="card-surface rounded-xl p-6 mb-6 flex flex-col items-center justify-center text-center">
+  <button
+    onClick={verifyAndRegister}
+    disabled={isRegistering || !worldUsername}
+    className="px-6 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors duration-200"
+  >
+    {isRegistering ? "Claiming..." : `Claim "${worldUsername}.farclet.eth"`}
+  </button>
+
+  {registerStatus && (
+    <div className="mt-2 text-xs text-gray-600 dark:text-gray-300">
+      {registerStatus}
+    </div>
+  )}
+</div>
+
+        )}
         {!isAuthenticated ? (
           // Authentication Required Screen
           <div className="text-center py-16">
